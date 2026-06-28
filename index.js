@@ -62,6 +62,24 @@ async function getDb() {
   // string. Indexing transactionId alone would wrongly treat those as
   // the same payment and block the second customer's real order.
   try {
+    // Clean up the OLD single-field index from before this fix existed.
+    // If it's still there, MongoDB enforces it *alongside* the new compound
+    // index below — so even though the app-level findOne() check correctly
+    // allows the same TxID under a different paymentMethod, the insertOne()
+    // would still be rejected by this leftover index. Must drop it first.
+    const existingIndexes = await cachedDb.collection("orders").indexes();
+    const hasLegacyIndex = existingIndexes.some(
+      (idx) => idx.name === "uniq_active_transactionId",
+    );
+    if (hasLegacyIndex) {
+      await cachedDb.collection("orders").dropIndex("uniq_active_transactionId");
+      console.log("Dropped legacy index uniq_active_transactionId");
+    }
+  } catch (err) {
+    console.error("Legacy index cleanup failed (continuing):", err.message);
+  }
+
+  try {
     await cachedDb.collection("orders").createIndex(
       { transactionId: 1, paymentMethod: 1 },
       {
