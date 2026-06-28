@@ -49,6 +49,37 @@ async function getDb() {
       { $setOnInsert: { isOpen: true, message: "" } },
       { upsert: true },
     );
+
+  // Prevent duplicate transaction IDs among active (non-cancelled) orders.
+  // This is a safety net under the app-level check in POST /api/orders —
+  // it stops a race condition where two requests with the same TxID land
+  // at almost the same time and both pass the findOne() check below.
+  try {
+    await cachedDb.collection("orders").createIndex(
+      { transactionId: 1 },
+      {
+        unique: true,
+        partialFilterExpression: {
+          status: {
+            $in: [
+              "Order Received",
+              "Payment Verified",
+              "Sourcing",
+              "Out for Delivery",
+              "Delivered",
+            ],
+          },
+        },
+        name: "uniq_active_transactionId",
+      },
+    );
+  } catch (err) {
+    // If old duplicate TxIDs already exist in the collection, index creation
+    // will fail. The server still runs fine without it — the app-level
+    // check in POST /api/orders is the primary guard either way.
+    console.error("Index creation failed (continuing without it):", err.message);
+  }
+
   return cachedDb;
 }
 
@@ -95,6 +126,25 @@ app.get("/api/check-url", async (req, res) => {
   }
 });
 
+// Check if a Transaction ID has already been used (lets the frontend warn
+// the customer before they submit — the real block happens in POST /api/orders).
+app.get("/api/check-txid", async (req, res) => {
+  try {
+    const db = await getDb();
+    const { txid } = req.query;
+    if (!txid) return res.json({ available: true });
+    const normalized = txid.trim().toUpperCase();
+    const existing = await db.collection("orders").findOne({
+      transactionId: normalized,
+      status: { $ne: "Cancelled" },
+    });
+    res.json({ available: !existing });
+  } catch (err) {
+    console.error("GET /api/check-txid:", err);
+    res.json({ available: true }); // fail open — submit-time check still protects you
+  }
+});
+
 // Place an order
 app.post("/api/orders", upload.single("screenshot"), async (req, res) => {
   try {
@@ -109,7 +159,12 @@ app.post("/api/orders", upload.single("screenshot"), async (req, res) => {
     }
 
     const body = req.body;
-    if (Number(body.amountPaid && body.budget) < 500) {
+
+    // FIX: this was `Number(body.amountPaid && body.budget) < 500`, which used
+    // the `&&` operator (not a comparison) and silently rejected any order
+    // where the optional `budget` field was left blank, regardless of the
+    // real amount paid. It must check amountPaid alone.
+    if (Number(body.amountPaid) < 500) {
       return res.status(400).json({ message: "Minimum order is ৳500." });
     }
 
@@ -163,7 +218,9 @@ app.post("/api/orders", upload.single("screenshot"), async (req, res) => {
       budget: body.budget?.trim() || "",
       paymentMethod: body.paymentMethod,
       amountPaid: Number(body.amountPaid),
-      transactionId: body.transactionId?.trim(),
+      // FIX: store the normalized (trimmed + uppercased) TxID — same value
+      // used in the duplicate check above — so future lookups stay consistent.
+      transactionId: normalizedTxId,
       screenshotUrl,
       isUrgent: body.isUrgent === "true",
       notes: body.notes?.trim() || "",
@@ -180,6 +237,14 @@ app.post("/api/orders", upload.single("screenshot"), async (req, res) => {
     await orders.insertOne(order);
     res.json({ success: true, orderId });
   } catch (err) {
+    // Catches the rare race condition: two submissions with the same TxID
+    // both pass the findOne() check above at nearly the same instant.
+    // The unique index created in getDb() throws error code 11000 here.
+    if (err.code === 11000) {
+      return res.status(409).json({
+        message: "This Transaction ID has already been used for another order.",
+      });
+    }
     console.error("POST /api/orders:", err);
     res.status(500).json({ message: "Server error. Please try again." });
   }
