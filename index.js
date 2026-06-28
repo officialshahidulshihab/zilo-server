@@ -54,9 +54,16 @@ async function getDb() {
   // This is a safety net under the app-level check in POST /api/orders —
   // it stops a race condition where two requests with the same TxID land
   // at almost the same time and both pass the findOne() check below.
+  //
+  // IMPORTANT: scoped to (transactionId + paymentMethod) together, not
+  // transactionId alone. bKash and Nagad are separate systems that issue
+  // TxIDs independently — "9F7K2LX1QZ" from bKash and "9F7K2LX1QZ" from
+  // Nagad are two different real payments that just happen to share a
+  // string. Indexing transactionId alone would wrongly treat those as
+  // the same payment and block the second customer's real order.
   try {
     await cachedDb.collection("orders").createIndex(
-      { transactionId: 1 },
+      { transactionId: 1, paymentMethod: 1 },
       {
         unique: true,
         partialFilterExpression: {
@@ -70,7 +77,7 @@ async function getDb() {
             ],
           },
         },
-        name: "uniq_active_transactionId",
+        name: "uniq_active_transactionId_paymentMethod",
       },
     );
   } catch (err) {
@@ -126,16 +133,20 @@ app.get("/api/check-url", async (req, res) => {
   }
 });
 
-// Check if a Transaction ID has already been used (lets the frontend warn
-// the customer before they submit — the real block happens in POST /api/orders).
+// Check if a Transaction ID has already been used for a given payment
+// method (lets the frontend warn the customer before they submit — the
+// real block happens in POST /api/orders). Scoped to paymentMethod too:
+// bKash and Nagad TxIDs are independent, so the same string under a
+// different method is not a duplicate.
 app.get("/api/check-txid", async (req, res) => {
   try {
     const db = await getDb();
-    const { txid } = req.query;
-    if (!txid) return res.json({ available: true });
+    const { txid, paymentMethod } = req.query;
+    if (!txid || !paymentMethod) return res.json({ available: true });
     const normalized = txid.trim().toUpperCase();
     const existing = await db.collection("orders").findOne({
       transactionId: normalized,
+      paymentMethod,
       status: { $ne: "Cancelled" },
     });
     res.json({ available: !existing });
@@ -169,18 +180,25 @@ app.post("/api/orders", upload.single("screenshot"), async (req, res) => {
     }
 
     // ── Duplicate TxID guard ──────────────────────────────────────────
+    // Scoped to (transactionId + paymentMethod) together — bKash and
+    // Nagad issue TxIDs independently, so the same string under different
+    // methods is not actually a duplicate payment.
     const normalizedTxId = body.transactionId?.trim().toUpperCase();
     if (!normalizedTxId) {
       return res.status(400).json({ message: "Transaction ID is required." });
     }
+    if (!body.paymentMethod) {
+      return res.status(400).json({ message: "Payment method is required." });
+    }
     const duplicate = await orders.findOne({
       transactionId: normalizedTxId,
+      paymentMethod: body.paymentMethod,
       status: { $ne: "Cancelled" },
     });
     if (duplicate) {
       return res.status(409).json({
         message:
-          "This Transaction ID has already been used for another order. If this is a mistake, message us on WhatsApp with your bKash/Nagad confirmation SMS.",
+          "This Transaction ID has already been used for another order with this payment method. If this is a mistake, message us on WhatsApp with your bKash/Nagad confirmation SMS.",
       });
     }
 
