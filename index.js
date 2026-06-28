@@ -14,7 +14,7 @@ app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
     credentials: true,
-  })
+  }),
 );
 app.use(express.json());
 
@@ -44,7 +44,11 @@ async function getDb() {
   // Seed the status document once
   await cachedDb
     .collection("status")
-    .updateOne({}, { $setOnInsert: { isOpen: true, message: "" } }, { upsert: true });
+    .updateOne(
+      {},
+      { $setOnInsert: { isOpen: true, message: "" } },
+      { upsert: true },
+    );
   return cachedDb;
 }
 
@@ -105,15 +109,31 @@ app.post("/api/orders", upload.single("screenshot"), async (req, res) => {
     }
 
     const body = req.body;
-    if (Number(body.amountPaid) < 500) {
+    if (Number(body.amountPaid && body.budget) < 500) {
       return res.status(400).json({ message: "Minimum order is ৳500." });
+    }
+
+    // ── Duplicate TxID guard ──────────────────────────────────────────
+    const normalizedTxId = body.transactionId?.trim().toUpperCase();
+    if (!normalizedTxId) {
+      return res.status(400).json({ message: "Transaction ID is required." });
+    }
+    const duplicate = await orders.findOne({
+      transactionId: normalizedTxId,
+      status: { $ne: "Cancelled" },
+    });
+    if (duplicate) {
+      return res.status(409).json({
+        message:
+          "This Transaction ID has already been used for another order. If this is a mistake, message us on WhatsApp with your bKash/Nagad confirmation SMS.",
+      });
     }
 
     // Auto-increment order ID
     const cnt = await counter.findOneAndUpdate(
       { _id: "orderCount" },
       { $inc: { seq: 1 } },
-      { upsert: true, returnDocument: "after" }
+      { upsert: true, returnDocument: "after" },
     );
     const orderId = `ZIL-${pad(cnt.seq || 1)}`;
 
@@ -128,29 +148,31 @@ app.post("/api/orders", upload.single("screenshot"), async (req, res) => {
     const now = new Date();
     const order = {
       orderId,
-      custName:      body.custName?.trim(),
-      phone:         body.phone?.trim(),
-      union:         body.union,
-      wardArea:      body.wardArea?.trim(),
-      villageBari:   body.villageBari?.trim(),
-      landmark:      body.landmark?.trim() || "",
-      itemName:      body.itemName?.trim(),
-      brandName:     body.brandName?.trim(),
-      refPhoto:      body.refPhoto?.trim() || "",
-      isRepeat:      body.isRepeat === "true",
-      shopName:      body.shopName?.trim() || "",
-      lastPrice:     body.lastPrice?.trim() || "",
-      budget:        body.budget?.trim() || "",
+      custName: body.custName?.trim(),
+      phone: body.phone?.trim(),
+      union: body.union,
+      wardArea: body.wardArea?.trim(),
+      villageBari: body.villageBari?.trim(),
+      landmark: body.landmark?.trim() || "",
+      itemName: body.itemName?.trim(),
+      brandName: body.brandName?.trim(),
+      refPhoto: body.refPhoto?.trim() || "",
+      isRepeat: body.isRepeat === "true",
+      shopName: body.shopName?.trim() || "",
+      lastPrice: body.lastPrice?.trim() || "",
+      budget: body.budget?.trim() || "",
       paymentMethod: body.paymentMethod,
-      amountPaid:    Number(body.amountPaid),
+      amountPaid: Number(body.amountPaid),
       transactionId: body.transactionId?.trim(),
       screenshotUrl,
-      isUrgent:      body.isUrgent === "true",
-      notes:         body.notes?.trim() || "",
-      status:        "Order Received",
-      statusNote:    "",
+      isUrgent: body.isUrgent === "true",
+      notes: body.notes?.trim() || "",
+      status: "Order Received",
+      statusNote: "",
       date: now.toLocaleDateString("en-GB", {
-        day: "2-digit", month: "short", year: "numeric",
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
       }),
       createdAt: now,
     };
@@ -172,21 +194,23 @@ app.get("/api/orders/track", async (req, res) => {
       return res.status(400).json({ message: "Missing fields." });
     }
 
-    const order = await db.collection("orders").findOne({ orderId: orderId.trim() });
+    const order = await db
+      .collection("orders")
+      .findOne({ orderId: orderId.trim() });
     if (!order) return res.status(404).json({ message: "Not found." });
 
-    const inputPhone  = phone.replace(/\D/g, "").slice(-11);
+    const inputPhone = phone.replace(/\D/g, "").slice(-11);
     const storedPhone = order.phone.replace(/\D/g, "").slice(-11);
     if (inputPhone !== storedPhone) {
       return res.status(404).json({ message: "Not found." });
     }
 
     res.json({
-      orderId:    order.orderId,
-      date:       order.date,
-      itemName:   order.itemName,
-      brandName:  order.brandName,
-      status:     order.status,
+      orderId: order.orderId,
+      date: order.date,
+      itemName: order.itemName,
+      brandName: order.brandName,
+      status: order.status,
       statusNote: order.statusNote || "",
     });
   } catch (err) {
@@ -214,7 +238,7 @@ app.get("/api/admin/orders", verifyAdmin, async (req, res) => {
         _id: o._id.toString(),
         // Keep screenshotUrl — admin panel renders it as <img src={...} />
         // which works fine with data-URIs.
-      }))
+      })),
     );
   } catch (err) {
     console.error("GET /api/admin/orders:", err);
@@ -231,8 +255,10 @@ app.get("/api/admin/stats", verifyAdmin, async (req, res) => {
     today.setHours(0, 0, 0, 0);
 
     const todayCount = all.filter((o) => new Date(o.createdAt) >= today).length;
-    const pending    = all.filter((o) => !["Delivered", "Cancelled"].includes(o.status)).length;
-    const revenue    = all
+    const pending = all.filter(
+      (o) => !["Delivered", "Cancelled"].includes(o.status),
+    ).length;
+    const revenue = all
       .filter((o) => o.status !== "Cancelled")
       .reduce((s, o) => s + (o.amountPaid || 0), 0);
 
@@ -261,10 +287,18 @@ app.patch("/api/admin/orders/:id/status", verifyAdmin, async (req, res) => {
       return res.status(400).json({ message: "Invalid status." });
     }
 
-    await db.collection("orders").updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { status: newStatus, statusNote: statusNote || "", updatedAt: new Date() } }
-    );
+    await db
+      .collection("orders")
+      .updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status: newStatus,
+            statusNote: statusNote || "",
+            updatedAt: new Date(),
+          },
+        },
+      );
     res.json({ success: true });
   } catch (err) {
     console.error("PATCH /api/admin/orders/:id/status:", err);
@@ -279,7 +313,10 @@ app.patch("/api/admin/status", verifyAdmin, async (req, res) => {
     const { isOpen, message } = req.body;
     await db
       .collection("status")
-      .updateOne({}, { $set: { isOpen: Boolean(isOpen), message: message || "" } });
+      .updateOne(
+        {},
+        { $set: { isOpen: Boolean(isOpen), message: message || "" } },
+      );
     res.json({ success: true });
   } catch (err) {
     console.error("PATCH /api/admin/status:", err);
