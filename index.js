@@ -1,6 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+const cookieParser = require("cookie-parser");
+const crypto = require("crypto");
 const { MongoClient, ObjectId } = require("mongodb");
 const multer = require("multer");
 
@@ -10,6 +12,8 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ── CORS ────────────────────────────────────────────────────────────────────
+// credentials: true is required so the browser will send/receive the
+// httpOnly admin session cookie used below.
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -17,6 +21,7 @@ app.use(
   }),
 );
 app.use(express.json());
+app.use(cookieParser());
 
 // ── MULTER — memory storage (works on Vercel; no writable filesystem needed) ─
 // Screenshots are stored as base64 data-URIs in MongoDB.
@@ -166,8 +171,59 @@ function getOrderWindowStatus(now = new Date()) {
   };
 }
 
+// ── ADMIN SESSION (cookie-based) ─────────────────────────────────────────────
+// The raw ADMIN_KEY is checked ONCE at login, server-side, and never sent to
+// the browser again. After that, the browser only holds an opaque, signed
+// session token in an httpOnly cookie — invisible to JS, invisible in any
+// bundled frontend code, and useless on its own if stolen via XSS (it's not
+// the actual admin key, and it's scoped + expiring).
+const SESSION_COOKIE = "zilo_admin_session";
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function getSessionSecret() {
+  // Falls back to ADMIN_KEY only if SESSION_SECRET isn't set, so this still
+  // works immediately without forcing you to add a new env var today — but
+  // setting a separate SESSION_SECRET in .env is recommended (see notes).
+  return process.env.SESSION_SECRET || process.env.ADMIN_KEY || "dev-secret";
+}
+
+function signSession(payload) {
+  const data = JSON.stringify(payload);
+  const sig = crypto
+    .createHmac("sha256", getSessionSecret())
+    .update(data)
+    .digest("hex");
+  return Buffer.from(data).toString("base64url") + "." + sig;
+}
+
+function verifySession(token) {
+  if (!token || !token.includes(".")) return null;
+  const [dataB64, sig] = token.split(".");
+  let data;
+  try {
+    data = Buffer.from(dataB64, "base64url").toString("utf8");
+  } catch {
+    return null;
+  }
+  const expectedSig = crypto
+    .createHmac("sha256", getSessionSecret())
+    .update(data)
+    .digest("hex");
+  // Constant-time comparison to avoid timing attacks on the signature check.
+  const sigBuf = Buffer.from(sig || "", "hex");
+  const expectedBuf = Buffer.from(expectedSig, "hex");
+  if (sigBuf.length !== expectedBuf.length) return null;
+  if (!crypto.timingSafeEqual(sigBuf, expectedBuf)) return null;
+
+  const parsed = JSON.parse(data);
+  if (!parsed.exp || Date.now() > parsed.exp) return null; // expired
+  return parsed;
+}
+
 const verifyAdmin = (req, res, next) => {
-  if (req.headers["x-admin-key"] !== process.env.ADMIN_KEY) {
+  const token = req.cookies?.[SESSION_COOKIE];
+  const session = verifySession(token);
+  if (!session || session.role !== "admin") {
     return res.status(403).json({ message: "Forbidden" });
   }
   next();
@@ -409,6 +465,44 @@ app.get("/api/orders/track", async (req, res) => {
   }
 });
 
+// ── ADMIN AUTH ROUTES ────────────────────────────────────────────────────────
+
+// Login — the ONLY place the raw admin key is ever checked. The key itself
+// travels over HTTPS in this one request body and is never stored client-side
+// or echoed back; only the signed session cookie is set in response.
+app.post("/api/admin/login", (req, res) => {
+  const { key } = req.body;
+  if (!key || key !== process.env.ADMIN_KEY) {
+    return res.status(403).json({ message: "Wrong key." });
+  }
+
+  const token = signSession({ role: "admin", exp: Date.now() + SESSION_TTL_MS });
+
+  res.cookie(SESSION_COOKIE, token, {
+    httpOnly: true, // not readable by frontend JS — defeats XSS theft
+    secure: process.env.NODE_ENV === "production", // HTTPS only in prod
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax", // "none" needed for cross-site client↔server on Vercel
+    maxAge: SESSION_TTL_MS,
+    path: "/",
+  });
+
+  res.json({ success: true });
+});
+
+// Logout — clears the session cookie.
+app.post("/api/admin/logout", (req, res) => {
+  res.clearCookie(SESSION_COOKIE, { path: "/" });
+  res.json({ success: true });
+});
+
+// Session check — lets the frontend know on page load whether the existing
+// cookie (if any) is still valid, without needing to hit a data route first.
+app.get("/api/admin/me", (req, res) => {
+  const token = req.cookies?.[SESSION_COOKIE];
+  const session = verifySession(token);
+  res.json({ authed: !!session });
+});
+
 // ── ADMIN ROUTES ─────────────────────────────────────────────────────────────
 
 // All orders
@@ -436,23 +530,47 @@ app.get("/api/admin/orders", verifyAdmin, async (req, res) => {
   }
 });
 
-// Stats
+// Stats — computed entirely in MongoDB via a single aggregation pipeline.
+// Previously this did find().toArray() on the WHOLE orders collection
+// (including base64 screenshot blobs) just to count 4 numbers — that's
+// both slow and memory-heavy once you're past a few hundred orders.
+// $facet runs all four sub-pipelines in one DB round trip; only 4 small
+// numbers ever leave Mongo and get loaded into Node memory.
 app.get("/api/admin/stats", verifyAdmin, async (req, res) => {
   try {
     const db = await getDb();
-    const all = await db.collection("orders").find().toArray();
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const todayCount = all.filter((o) => new Date(o.createdAt) >= today).length;
-    const pending = all.filter(
-      (o) => !["Delivered", "Cancelled"].includes(o.status),
-    ).length;
-    const revenue = all
-      .filter((o) => o.status !== "Cancelled")
-      .reduce((s, o) => s + (o.amountPaid || 0), 0);
+    const [result] = await db
+      .collection("orders")
+      .aggregate([
+        {
+          $facet: {
+            total: [{ $count: "count" }],
+            today: [
+              { $match: { createdAt: { $gte: today } } },
+              { $count: "count" },
+            ],
+            pending: [
+              { $match: { status: { $nin: ["Delivered", "Cancelled"] } } },
+              { $count: "count" },
+            ],
+            revenue: [
+              { $match: { status: { $ne: "Cancelled" } } },
+              { $group: { _id: null, sum: { $sum: "$amountPaid" } } },
+            ],
+          },
+        },
+      ])
+      .toArray();
 
-    res.json({ total: all.length, today: todayCount, pending, revenue });
+    res.json({
+      total: result.total[0]?.count || 0,
+      today: result.today[0]?.count || 0,
+      pending: result.pending[0]?.count || 0,
+      revenue: result.revenue[0]?.sum || 0,
+    });
   } catch (err) {
     console.error("GET /api/admin/stats:", err);
     res.status(500).json({ message: "Server error." });
