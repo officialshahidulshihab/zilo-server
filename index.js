@@ -242,6 +242,14 @@ const verifyAdmin = (req, res, next) => {
   next();
 };
 
+const checkOrigin = (req, res, next) => {
+  const allowed = process.env.CLIENT_URL;
+  if (req.headers.origin !== allowed) {
+    return res.status(403).json({ message: "Forbidden" });
+  }
+  next();
+};
+
 // ── PUBLIC ROUTES ────────────────────────────────────────────────────────────
 
 // Health check
@@ -592,13 +600,7 @@ app.get("/api/admin/stats", verifyAdmin, checkOrigin, async (req, res) => {
     res.status(500).json({ message: "Server error." });
   }
 });
-const checkOrigin = (req, res, next) => {
-  const allowed = process.env.CLIENT_URL;
-  if (req.headers.origin !== allowed) {
-    return res.status(403).json({ message: "Forbidden" });
-  }
-  next();
-};
+
 // Update order status
 app.patch("/api/admin/orders/:id/status", verifyAdmin,checkOrigin, async (req, res) => {
   try {
