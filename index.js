@@ -113,6 +113,59 @@ function pad(n) {
   return String(n).padStart(4, "0");
 }
 
+// ── ORDER WINDOW SCHEDULE ────────────────────────────────────────────────────
+// Bangladesh (Asia/Dhaka) is a fixed UTC+6 all year — no daylight saving —
+// so "what time is it in Dhaka" can be computed by shifting the UTC
+// timestamp forward 6 hours and reading it back with the UTC getters.
+// No timezone library, no cron job: this is recalculated fresh on every
+// request, so it's always accurate to the second and can't drift or miss
+// a trigger the way a scheduled job could.
+//
+// Daily cycle:
+//   00:00 – 12:00  → OPEN    "order now, delivered today evening"
+//   12:00 – 18:00  → CLOSED  sourcing & delivering today's batch
+//   18:00 – 24:00  → OPEN    "order now, delivered tomorrow"
+const BD_OFFSET_MS = 6 * 60 * 60 * 1000;
+
+function getOrderWindowStatus(now = new Date()) {
+  const bd = new Date(now.getTime() + BD_OFFSET_MS);
+  const minutesNow = bd.getUTCHours() * 60 + bd.getUTCMinutes();
+
+  const NOON = 12 * 60;
+  const SIX_PM = 18 * 60;
+
+  // Midnight today in BD wall time, converted back to a real UTC instant —
+  // used as the zero-point for building exact transition timestamps.
+  const bdMidnight = new Date(bd);
+  bdMidnight.setUTCHours(0, 0, 0, 0);
+  const realMidnight = new Date(bdMidnight.getTime() - BD_OFFSET_MS);
+  const toReal = (minutesFromMidnight) =>
+    new Date(realMidnight.getTime() + minutesFromMidnight * 60 * 1000);
+
+  if (minutesNow < NOON) {
+    return {
+      phase: "morning",
+      acceptingOrders: true,
+      etaText: "today evening",
+      nextTransitionAt: toReal(NOON).toISOString(),
+    };
+  }
+  if (minutesNow < SIX_PM) {
+    return {
+      phase: "midday-closed",
+      acceptingOrders: false,
+      etaText: null,
+      nextTransitionAt: toReal(SIX_PM).toISOString(),
+    };
+  }
+  return {
+    phase: "evening",
+    acceptingOrders: true,
+    etaText: "tomorrow",
+    nextTransitionAt: toReal(NOON + 24 * 60).toISOString(), // next day's noon
+  };
+}
+
 const verifyAdmin = (req, res, next) => {
   if (req.headers["x-admin-key"] !== process.env.ADMIN_KEY) {
     return res.status(403).json({ message: "Forbidden" });
@@ -125,12 +178,37 @@ const verifyAdmin = (req, res, next) => {
 // Health check
 app.get("/", (req, res) => res.send("ZILO server running."));
 
-// Service status
+// Service status — merges the admin's manual day-off override (used for
+// exam days, holidays — see /api/admin/status) with the automatic
+// morning / midday-closed / evening schedule.
 app.get("/api/status", async (req, res) => {
   try {
     const db = await getDb();
     const s = await db.collection("status").findOne({});
-    res.json({ isOpen: s?.isOpen ?? true, message: s?.message ?? "" });
+    const window = getOrderWindowStatus();
+
+    // Manual override always wins: if the admin explicitly paused the whole
+    // day, that's a full closure regardless of what time it is.
+    if (s?.isOpen === false) {
+      return res.json({
+        isOpen: false,
+        message: s.message || "We're not running today. Check back tomorrow.",
+        phase: "manual-closed",
+        etaText: null,
+        nextTransitionAt: null,
+      });
+    }
+
+    // Otherwise the automatic schedule decides.
+    res.json({
+      isOpen: window.acceptingOrders,
+      message: window.acceptingOrders
+        ? ""
+        : "Orders are paused while we source & deliver today's batch. Back online at 6 PM.",
+      phase: window.phase,
+      etaText: window.etaText,
+      nextTransitionAt: window.nextTransitionAt,
+    });
   } catch (err) {
     console.error("GET /api/status:", err);
     res.status(500).json({ message: "Server error." });
@@ -185,6 +263,17 @@ app.post("/api/orders", upload.single("screenshot"), async (req, res) => {
     const s = await status.findOne({});
     if (!s?.isOpen) {
       return res.status(403).json({ message: "Service is off today." });
+    }
+
+    // Re-check the automatic midday closure server-side too — the frontend
+    // disables the form during this window, but a direct API call must be
+    // blocked here regardless, the same way the manual isOpen check above is.
+    const window = getOrderWindowStatus();
+    if (!window.acceptingOrders) {
+      return res.status(403).json({
+        message:
+          "Orders are paused 12 PM–6 PM while we source & deliver today's batch. Please try again after 6 PM.",
+      });
     }
 
     const body = req.body;
