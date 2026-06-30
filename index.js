@@ -491,7 +491,7 @@ app.get("/api/orders/track", async (req, res) => {
 // Login — the ONLY place the raw admin key is ever checked. The key itself
 // travels over HTTPS in this one request body and is never stored client-side
 // or echoed back; only the signed session cookie is set in response.
-app.post("/api/admin/login", verifyAdmin,checkOrigin,(req, res) => {
+app.post("/api/admin/login", (req, res) => {
   const { key } = req.body;
   if (!key || key !== process.env.ADMIN_KEY) {
     return res.status(403).json({ message: "Wrong key." });
@@ -503,9 +503,9 @@ app.post("/api/admin/login", verifyAdmin,checkOrigin,(req, res) => {
   });
 
   res.cookie(SESSION_COOKIE, token, {
-    httpOnly: true, // not readable by frontend JS — defeats XSS theft
-    secure: process.env.NODE_ENV === "production", // HTTPS only in prod
-    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax", // "none" needed for cross-site client↔server on Vercel
+    httpOnly: true,
+    secure: true,       // always true — Vercel is always HTTPS
+    sameSite: "none",   // required for cross-site (zilo-client ↔ zilo-server)
     maxAge: SESSION_TTL_MS,
     path: "/",
   });
@@ -515,13 +515,18 @@ app.post("/api/admin/login", verifyAdmin,checkOrigin,(req, res) => {
 
 // Logout — clears the session cookie.
 app.post("/api/admin/logout", (req, res) => {
-  res.clearCookie(SESSION_COOKIE, { path: "/" });
+  res.clearCookie(SESSION_COOKIE, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+    path: "/",
+  });
   res.json({ success: true });
 });
 
 // Session check — lets the frontend know on page load whether the existing
 // cookie (if any) is still valid, without needing to hit a data route first.
-app.get("/api/admin/me", verifyAdmin,checkOrigin, (req, res) => {
+app.get("/api/admin/me", (req, res) => {
   const token = req.cookies?.[SESSION_COOKIE];
   const session = verifySession(token);
   res.json({ authed: !!session });
@@ -530,7 +535,7 @@ app.get("/api/admin/me", verifyAdmin,checkOrigin, (req, res) => {
 // ── ADMIN ROUTES ─────────────────────────────────────────────────────────────
 
 // All orders
-app.get("/api/admin/orders", verifyAdmin,checkOrigin, async (req, res) => {
+app.get("/api/admin/orders", verifyAdmin, async (req, res) => {
   try {
     const db = await getDb();
     const result = await db
@@ -560,7 +565,7 @@ app.get("/api/admin/orders", verifyAdmin,checkOrigin, async (req, res) => {
 // both slow and memory-heavy once you're past a few hundred orders.
 // $facet runs all four sub-pipelines in one DB round trip; only 4 small
 // numbers ever leave Mongo and get loaded into Node memory.
-app.get("/api/admin/stats", verifyAdmin, checkOrigin, async (req, res) => {
+app.get("/api/admin/stats", verifyAdmin, async (req, res) => {
   try {
     const db = await getDb();
     const today = new Date();
@@ -602,7 +607,7 @@ app.get("/api/admin/stats", verifyAdmin, checkOrigin, async (req, res) => {
 });
 
 // Update order status
-app.patch("/api/admin/orders/:id/status", verifyAdmin,checkOrigin, async (req, res) => {
+app.patch("/api/admin/orders/:id/status", verifyAdmin, async (req, res) => {
   try {
     const db = await getDb();
     const { id } = req.params;
@@ -637,7 +642,7 @@ app.patch("/api/admin/orders/:id/status", verifyAdmin,checkOrigin, async (req, r
 });
 
 // Toggle service open/closed
-app.patch("/api/admin/status", verifyAdmin,checkOrigin, async (req, res) => {
+app.patch("/api/admin/status", verifyAdmin, async (req, res) => {
   try {
     const db = await getDb();
     const { isOpen, message } = req.body;
