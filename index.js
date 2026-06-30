@@ -37,6 +37,14 @@ const upload = multer({
 let cachedClient = null;
 let cachedDb = null;
 
+const rateLimit = require("express-rate-limit");
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 min
+  max: 5, // 5 attempts per IP per window
+  message: { message: "Too many login attempts. Try again later." },
+});
+
 async function getDb() {
   if (cachedDb) return cachedDb;
   const client = new MongoClient(process.env.MONGODB_URI, {
@@ -77,7 +85,9 @@ async function getDb() {
       (idx) => idx.name === "uniq_active_transactionId",
     );
     if (hasLegacyIndex) {
-      await cachedDb.collection("orders").dropIndex("uniq_active_transactionId");
+      await cachedDb
+        .collection("orders")
+        .dropIndex("uniq_active_transactionId");
       console.log("Dropped legacy index uniq_active_transactionId");
     }
   } catch (err) {
@@ -107,7 +117,10 @@ async function getDb() {
     // If old duplicate TxIDs already exist in the collection, index creation
     // will fail. The server still runs fine without it — the app-level
     // check in POST /api/orders is the primary guard either way.
-    console.error("Index creation failed (continuing without it):", err.message);
+    console.error(
+      "Index creation failed (continuing without it):",
+      err.message,
+    );
   }
 
   return cachedDb;
@@ -476,7 +489,10 @@ app.post("/api/admin/login", (req, res) => {
     return res.status(403).json({ message: "Wrong key." });
   }
 
-  const token = signSession({ role: "admin", exp: Date.now() + SESSION_TTL_MS });
+  const token = signSession({
+    role: "admin",
+    exp: Date.now() + SESSION_TTL_MS,
+  });
 
   res.cookie(SESSION_COOKIE, token, {
     httpOnly: true, // not readable by frontend JS — defeats XSS theft
@@ -576,7 +592,13 @@ app.get("/api/admin/stats", verifyAdmin, async (req, res) => {
     res.status(500).json({ message: "Server error." });
   }
 });
-
+const checkOrigin = (req, res, next) => {
+  const allowed = process.env.CLIENT_URL;
+  if (req.headers.origin !== allowed) {
+    return res.status(403).json({ message: "Forbidden" });
+  }
+  next();
+};
 // Update order status
 app.patch("/api/admin/orders/:id/status", verifyAdmin, async (req, res) => {
   try {
@@ -595,18 +617,16 @@ app.patch("/api/admin/orders/:id/status", verifyAdmin, async (req, res) => {
       return res.status(400).json({ message: "Invalid status." });
     }
 
-    await db
-      .collection("orders")
-      .updateOne(
-        { _id: new ObjectId(id) },
-        {
-          $set: {
-            status: newStatus,
-            statusNote: statusNote || "",
-            updatedAt: new Date(),
-          },
+    await db.collection("orders").updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status: newStatus,
+          statusNote: statusNote || "",
+          updatedAt: new Date(),
         },
-      );
+      },
+    );
     res.json({ success: true });
   } catch (err) {
     console.error("PATCH /api/admin/orders/:id/status:", err);
