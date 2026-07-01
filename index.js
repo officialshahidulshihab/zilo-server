@@ -5,6 +5,16 @@ const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
 const { MongoClient, ObjectId } = require("mongodb");
 const multer = require("multer");
+const cloudinary = require("cloudinary").v2;
+
+// ── CLOUDINARY — screenshot storage ─────────────────────────────────────────
+// Credentials come from env vars (never hardcoded). Set these in Vercel:
+//   CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 dotenv.config();
 
@@ -23,9 +33,9 @@ app.use(
 app.use(express.json());
 app.use(cookieParser());
 
-// ── MULTER — memory storage (works on Vercel; no writable filesystem needed) ─
-// Screenshots are stored as base64 data-URIs in MongoDB.
-// Fine for a low-volume delivery service (typical screenshot < 500 KB).
+// ── MULTER — memory storage ──────────────────────────────────────────────────
+// Buffers the uploaded file in memory so we can stream it to Cloudinary.
+// The file never touches the filesystem (Vercel has no persistent disk).
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
@@ -394,12 +404,19 @@ app.post("/api/orders", upload.single("screenshot"), async (req, res) => {
     );
     const orderId = `ZIL-${pad(cnt.seq || 1)}`;
 
-    // Convert uploaded screenshot to base64 data-URI so it survives across
-    // serverless invocations (no persistent filesystem on Vercel).
+    // Upload screenshot to Cloudinary — returns a permanent URL.
+    // Multer still buffers the file in memory; we stream that buffer to
+    // Cloudinary via upload_stream, then store only the returned URL in Mongo.
+    // This keeps each order document tiny (a URL string vs. a ~500 KB blob).
     let screenshotUrl = "";
     if (req.file) {
-      const mime = req.file.mimetype || "image/jpeg";
-      screenshotUrl = `data:${mime};base64,${req.file.buffer.toString("base64")}`;
+      screenshotUrl = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { folder: "zilo-screenshots", resource_type: "image" },
+          (err, result) => (err ? reject(err) : resolve(result.secure_url)),
+        );
+        stream.end(req.file.buffer);
+      });
     }
 
     const now = new Date();
@@ -549,8 +566,8 @@ app.get("/api/admin/orders", verifyAdmin, async (req, res) => {
       result.map((o) => ({
         ...o,
         _id: o._id.toString(),
-        // Keep screenshotUrl — admin panel renders it as <img src={...} />
-        // which works fine with data-URIs.
+        // screenshotUrl is now a Cloudinary URL (small string), not a base64 blob,
+        // so including it here is fine — no payload size concern.
       })),
     );
   } catch (err) {
